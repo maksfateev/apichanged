@@ -93,26 +93,26 @@ class CrypturaPaymentContext(RandomPlaceholdersMixin, BasePaymentContext):
     merchant_id: str = None
     success_url: str = None
     fail_url: str = None
-    client_id: str = None
 
     def get_payin_payload(self) -> dict[str, Any]:
-        amount = display_decimal(self.amount, 2)
         return {
-            "order_id": self.order_id,
-            "merchant_id": self.merchant_id,
-            "amount": str(amount),
+            # следующие поля остаются совместимыми по структуре с исходной интеграцией,
+            # но уже ориентированы на работу с API Cryptura
+            "orderId": self.order_id,
+            "merchantId": self.merchant_id,
+            "amount": int(display_decimal(self.amount, 0)),
             "currency": self.currency,
             "method": self.payment_method,
-            "callback_url": self.webhook_url,
-            "success_url": self.success_url,
-            "fail_url": self.fail_url,
-            "client": {
-                "id": self.client_id or str(uuid.uuid4()),
-                "ip": self._random_ip,
-                "name": f'{self._random_last_name} {self._random_last_name}',
+            "callbackUri": self.webhook_url,
+            "successUri": self.success_url,
+            "failUri": self.fail_url,
+            "payer": {
+                "userId": str(uuid.uuid4()),
+                "userIp": self._random_ip,
+                "customerName": f'{self._random_last_name} {self._random_last_name}',
                 "phone": self._random_phone,
                 "email": self._random_email,
-                "stats": {
+                "payments": {
                     "successful": 5,
                     "expired": 1
                 }
@@ -120,14 +120,17 @@ class CrypturaPaymentContext(RandomPlaceholdersMixin, BasePaymentContext):
         }
 
     def parse_payin_response(self, response_data) -> dict[str, Any]:
-        result = response_data.get('data') or response_data.get('result') or response_data
+        result = response_data.get('result', {}) or response_data
+
         return {
-            "id": result.get("id") or result.get("payment_id") or result.get("invoice_id"),
-            "requisites": result.get("address") or result.get("requisites") or result.get("payment_url"),
-            "recipient": result.get('recipient') or result.get('holder') or result.get('merchant'),
-            "bank": result.get('bank') or result.get('provider')
+            # ожидаем, что в ответе Cryptura вернет хотя бы идентификатор
+            "id": result.get("id") or result.get("paymentId"),
+            # ниже — унифицированные поля реквизитов, которые будут
+            # привязаны к фактической структуре ответа Cryptura
+            "requisites": result.get("address") or result.get("requisites"),
+            "recipient": result.get("recipient"),
+            "bank": result.get("bank"),
         }
-SpiritPaymentContext = CrypturaPaymentContext
 class BaseProviderMixin(ABC, RequiredMethodsMixin):
     class RequisitesNotFound(Exception):
         pass
@@ -283,12 +286,12 @@ class BaseProviderMixin(ABC, RequiredMethodsMixin):
 
             log_request_response(self.provider_method_name, url, headers, payload, response_data, **kwargs)
 class BaseCrypturaProvider(BaseProviderMixin):
-    base_url = os.getenv('CRYPTURA_BASE_URL', "https://api.cryptura.pro")
-    payin_endpoint = os.getenv('CRYPTURA_PAYIN_ENDPOINT', '/api/v1/payments')
+    base_url = "https://cryptura.space/api"
+    test_base_url = "https://cryptura.space/api-test"
 
-    _mid = os.environ['CRYPTURA_MERCHANT_ID']
+    _mid = os.environ['CRYPTURA_MID']
     _secret_key = os.environ['CRYPTURA_SECRET_KEY']
-    _token = os.environ['CRYPTURA_API_KEY']
+    _token = os.environ['CRYPTURA_TOKEN']
 
     def _get_signature(self, data: dict):
         string = json.dumps(data, separators=(",", ":"), sort_keys=True)
@@ -296,34 +299,34 @@ class BaseCrypturaProvider(BaseProviderMixin):
         return hmac.new(
             secret_key,
             string.encode(),
-            hashlib.sha256
+            hashlib.sha256,
         ).hexdigest()
 
     def _get_headers(self, data: dict) -> dict[str, str]:
         sign = self._get_signature(data)
 
         return {
-            'Content-Type': 'application/json',
-            'X-API-KEY': self._token,
-            'X-SIGNATURE': sign,
-            'Authorization': f'Bearer {self._token}'
+            "Content-Type": "application/json",
+            # токен и подпись берутся из параметров мерчанта Cryptura
+            "Authorization": f"Bearer {self._token}",
+            "Signature": sign,
         }
 
     def raise_for_not_found(self, response: Response):
-        if response.status_code in (400, 401, 403, 404, 422, 500, 502):
+        if response.status_code in (400, 404, 500, 502):
             raise self.RequisitesNotFound()
 
     def check_empty_response(self, response_data: dict[str, Any]):
-        status = response_data.get('status')
-        if status is True or status in {'success', 'ok'}:
-            return response_data
-        if response_data.get('success') is True:
+        if response_data.get('status', False) is True:
             return response_data
 
         raise self.RequestException(response_data)
 
-    def _get_base_requisites(self, ctx: CrypturaPaymentContext):
-        url = self.base_url + self.payin_endpoint
+    def _get_base_requisites(self, ctx: CrypturaPaymentContext, use_test_env: bool = False):
+        base_url = self.test_base_url if use_test_env else self.base_url
+        # конкретный путь эндпоинта потребуется скорректировать под фактическую спецификацию Cryptura
+        url = base_url + '/payments'
+
         ctx = ctx.update_from_object(CrypturaPaymentContext(
             merchant_id=self._mid,
             success_url=self._success_url,
@@ -335,26 +338,18 @@ class BaseCrypturaProvider(BaseProviderMixin):
 
         response_data = self._request_to_provider(url=url, headers=headers, payload=payload, timeout=15)
         return ctx.parse_payin_response(response_data)
-BaseSpiritProvider = BaseCrypturaProvider
-
-
 class RubCrypturaProvider(BaseCrypturaProvider):
     @property
     def _webhook_url(self):
         return settings.BASE_SITE_URL + str(reverse_lazy('payment:rub_spirit_webhook'))
 
-    def _get_rub_requisites(self, ctx: CrypturaPaymentContext):
+    def _get_rub_requisites(self, ctx: CrypturaPaymentContext, use_test_env: bool = False):
         ctx = ctx.update_from_object(CrypturaPaymentContext(
             webhook_url=self._webhook_url,
             currency='RUB'
         ))
 
-        return self._get_base_requisites(ctx)
-
-
-RubSpiritProvider = RubCrypturaProvider
-
-
+        return self._get_base_requisites(ctx, use_test_env=use_test_env)
 class Provider(RubCrypturaProvider):
     def get_requisites(self, amount, order_id, *args, **kwargs):
         ctx = CrypturaPaymentContext(
