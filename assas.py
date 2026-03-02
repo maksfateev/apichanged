@@ -86,31 +86,33 @@ class BasePaymentContext(ABC, RequiredMethodsMixin):
                 f"{cls.__name__} must implement either PAYIN or PAYOUT contract"
             )
 @dataclass
-class SpiritPaymentContext(RandomPlaceholdersMixin, BasePaymentContext):
+class CrypturaPaymentContext(RandomPlaceholdersMixin, BasePaymentContext):
     currency: str = None
     webhook_url: str = None
     payment_method: str = None
     merchant_id: str = None
     success_url: str = None
     fail_url: str = None
+    client_id: str = None
 
     def get_payin_payload(self) -> dict[str, Any]:
+        amount = display_decimal(self.amount, 2)
         return {
-            "orderId": self.order_id,
-            "merchantId": self.merchant_id,
-            "amount": int(display_decimal(self.amount, 0)),
+            "order_id": self.order_id,
+            "merchant_id": self.merchant_id,
+            "amount": str(amount),
             "currency": self.currency,
             "method": self.payment_method,
-            "callbackUri": self.webhook_url,
-            "successUri": self.success_url,
-            "failUri": self.fail_url,
-            "payer": {
-                "userId": str(uuid.uuid4()),
-                "userIp": self._random_ip,
-                "customerName": f'{self._random_last_name} {self._random_last_name}',
+            "callback_url": self.webhook_url,
+            "success_url": self.success_url,
+            "fail_url": self.fail_url,
+            "client": {
+                "id": self.client_id or str(uuid.uuid4()),
+                "ip": self._random_ip,
+                "name": f'{self._random_last_name} {self._random_last_name}',
                 "phone": self._random_phone,
                 "email": self._random_email,
-                "payments": {
+                "stats": {
                     "successful": 5,
                     "expired": 1
                 }
@@ -118,13 +120,14 @@ class SpiritPaymentContext(RandomPlaceholdersMixin, BasePaymentContext):
         }
 
     def parse_payin_response(self, response_data) -> dict[str, Any]:
-        result = response_data.get('result', {})
+        result = response_data.get('data') or response_data.get('result') or response_data
         return {
-            "id": result["id"],
-            "requisites": result["address"],
-            "recipient": result['recipient'],
-            "bank": result['bank']
+            "id": result.get("id") or result.get("payment_id") or result.get("invoice_id"),
+            "requisites": result.get("address") or result.get("requisites") or result.get("payment_url"),
+            "recipient": result.get('recipient') or result.get('holder') or result.get('merchant'),
+            "bank": result.get('bank') or result.get('provider')
         }
+SpiritPaymentContext = CrypturaPaymentContext
 class BaseProviderMixin(ABC, RequiredMethodsMixin):
     class RequisitesNotFound(Exception):
         pass
@@ -279,12 +282,13 @@ class BaseProviderMixin(ABC, RequiredMethodsMixin):
             }
 
             log_request_response(self.provider_method_name, url, headers, payload, response_data, **kwargs)
-class BaseSpiritProvider(BaseProviderMixin):
-    base_url = "https://spiritpay.club"
+class BaseCrypturaProvider(BaseProviderMixin):
+    base_url = os.getenv('CRYPTURA_BASE_URL', "https://api.cryptura.pro")
+    payin_endpoint = os.getenv('CRYPTURA_PAYIN_ENDPOINT', '/api/v1/payments')
 
-    _mid = os.environ['SPIRIT_MID']
-    _secret_key = os.environ['SPIRIT_SECRET_KEY']
-    _token = os.environ['SPIRIT_TOKEN']
+    _mid = os.environ['CRYPTURA_MERCHANT_ID']
+    _secret_key = os.environ['CRYPTURA_SECRET_KEY']
+    _token = os.environ['CRYPTURA_API_KEY']
 
     def _get_signature(self, data: dict):
         string = json.dumps(data, separators=(",", ":"), sort_keys=True)
@@ -300,23 +304,27 @@ class BaseSpiritProvider(BaseProviderMixin):
 
         return {
             'Content-Type': 'application/json',
-            'Authorization': f'Bearer {self._token}',
-            'Signature': sign
+            'X-API-KEY': self._token,
+            'X-SIGNATURE': sign,
+            'Authorization': f'Bearer {self._token}'
         }
 
     def raise_for_not_found(self, response: Response):
-        if response.status_code in (400, 404, 500, 502):
+        if response.status_code in (400, 401, 403, 404, 422, 500, 502):
             raise self.RequisitesNotFound()
 
     def check_empty_response(self, response_data: dict[str, Any]):
-        if response_data.get('status', False) is True:
+        status = response_data.get('status')
+        if status is True or status in {'success', 'ok'}:
+            return response_data
+        if response_data.get('success') is True:
             return response_data
 
         raise self.RequestException(response_data)
 
-    def _get_base_requisites(self, ctx: SpiritPaymentContext):
-        url = self.base_url + '/api/v2/payments'
-        ctx = ctx.update_from_object(SpiritPaymentContext(
+    def _get_base_requisites(self, ctx: CrypturaPaymentContext):
+        url = self.base_url + self.payin_endpoint
+        ctx = ctx.update_from_object(CrypturaPaymentContext(
             merchant_id=self._mid,
             success_url=self._success_url,
             fail_url=self._fail_url
@@ -327,21 +335,29 @@ class BaseSpiritProvider(BaseProviderMixin):
 
         response_data = self._request_to_provider(url=url, headers=headers, payload=payload, timeout=15)
         return ctx.parse_payin_response(response_data)
-class RubSpiritProvider(BaseSpiritProvider):
+BaseSpiritProvider = BaseCrypturaProvider
+
+
+class RubCrypturaProvider(BaseCrypturaProvider):
     @property
     def _webhook_url(self):
         return settings.BASE_SITE_URL + str(reverse_lazy('payment:rub_spirit_webhook'))
 
-    def _get_rub_requisites(self, ctx: SpiritPaymentContext):
-        ctx = ctx.update_from_object(SpiritPaymentContext(
+    def _get_rub_requisites(self, ctx: CrypturaPaymentContext):
+        ctx = ctx.update_from_object(CrypturaPaymentContext(
             webhook_url=self._webhook_url,
             currency='RUB'
         ))
 
         return self._get_base_requisites(ctx)
-class Provider(RubSpiritProvider):
+
+
+RubSpiritProvider = RubCrypturaProvider
+
+
+class Provider(RubCrypturaProvider):
     def get_requisites(self, amount, order_id, *args, **kwargs):
-        ctx = SpiritPaymentContext(
+        ctx = CrypturaPaymentContext(
             amount=amount,
             order_id=order_id,
             payment_method='c2c'
