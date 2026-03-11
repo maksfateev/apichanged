@@ -1,6 +1,6 @@
+"""Public provider interfaces."""
+
 from payment.providers.mixins import BaseProviderMixin, BaseSpiritProvider
-from payment.providers.rub.spirit import RubSpiritProvider
-from payment.providers.rub.spirit.c2c import Provider
 from payment.providers.types import BasePaymentContext, RequiredMethodsMixin, SpiritPaymentContext
 
 __all__ = [
@@ -9,6 +9,4 @@ __all__ = [
     "SpiritPaymentContext",
     "BaseProviderMixin",
     "BaseSpiritProvider",
-    "RubSpiritProvider",
-    "Provider",
 ]
